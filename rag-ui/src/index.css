@@ -1,0 +1,43 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
+@import "tailwindcss";
+
+:root {
+  font-family: 'DM Sans', sans-serif;
+  color: #e8e9ee;
+  background: #111215;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-optical-sizing: auto;
+  font-weight: 400;
+  color-scheme: dark;
+  --page: #111215;
+  --panel: #17181d;
+  --panel-2: #1c1d23;
+  --line: rgba(255, 255, 255, 0.075);
+  --line-bright: rgba(255, 255, 255, 0.12);
+  --text: #e8e9ee;
+  --muted: #92939e;
+  --dim: #62636e;
+  --accent: #c6f277;
+  --accent-dark: #a5ce5d;
+  --mono: 'DM Mono', monospace;
+  --heading: 'Manrope', sans-serif;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: var(--page);
+}
+button, input, textarea { font: inherit; }
+button { color: inherit; }
+button:focus-visible, input:focus-visible, textarea:focus-visible {
+  outline: 2px solid rgba(198, 242, 119, 0.75);
+  outline-offset: 3px;
+}
+::selection { color: #111215; background: var(--accent); }
+#root { min-height: 100vh; }
