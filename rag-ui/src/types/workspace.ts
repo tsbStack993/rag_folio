@@ -23,6 +23,7 @@ export type ChatSession = {
 }
 
 export type Source = {
+  id?: string
   title: string
   page: number
   score: number

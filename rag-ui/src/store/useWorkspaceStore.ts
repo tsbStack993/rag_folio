@@ -34,6 +34,13 @@ type WorkspaceState = {
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : 'An unexpected API error occurred'
 
+let activeStreamController: AbortController | null = null
+
+const abortActiveStream = () => {
+  activeStreamController?.abort()
+  activeStreamController = null
+}
+
 const sortSessions = (sessions: ChatSession[]) =>
   [...sessions].sort((first, second) => second.updatedAt.localeCompare(first.updatedAt))
 
@@ -147,7 +154,8 @@ export const useWorkspaceStore = create<WorkspaceState>()(
       clearError: () => set({ error: null }),
       toggleTheme: () =>
         set((state) => ({ theme: state.theme === 'dark' ? 'light' : 'dark' })),
-      logout: () =>
+      logout: () => {
+        abortActiveStream()
         set({
           currentUser: null,
           accessToken: null,
@@ -157,7 +165,10 @@ export const useWorkspaceStore = create<WorkspaceState>()(
           messages: [],
           sessionHistory: [],
           error: null,
-        }),
+          isSending: false,
+          isStreaming: false,
+        })
+      },
       selectSubject: async (subjectId) => {
         const subject = get().subjects.find((item) => item.id === subjectId)
         const token = get().accessToken
@@ -165,12 +176,15 @@ export const useWorkspaceStore = create<WorkspaceState>()(
           set({ error: 'The selected subject is unavailable. Refresh and try again.' })
           return
         }
+        abortActiveStream()
         set({
           activeSubject: subject,
           activeSessionId: null,
           sessions: [],
           messages: [],
           isLoading: true,
+          isSending: false,
+          isStreaming: false,
           error: null,
         })
         try {
@@ -193,14 +207,18 @@ export const useWorkspaceStore = create<WorkspaceState>()(
           set({ isLoading: false })
         }
       },
-      clearSubject: () =>
+      clearSubject: () => {
+        abortActiveStream()
         set({
           activeSubject: null,
           activeSessionId: null,
           sessions: [],
           messages: [],
+          isSending: false,
+          isStreaming: false,
           error: null,
-        }),
+        })
+      },
       createSession: async () => {
         const { accessToken, activeSubject } = get()
         if (!accessToken || !activeSubject || get().isLoading || get().isSending) return null
@@ -227,7 +245,15 @@ export const useWorkspaceStore = create<WorkspaceState>()(
           set({ error: 'That conversation is not available in this workspace.' })
           return
         }
-        set({ activeSessionId: sessionId, messages: [], isLoading: true, error: null })
+        abortActiveStream()
+        set({
+          activeSessionId: sessionId,
+          messages: [],
+          isLoading: true,
+          isSending: false,
+          isStreaming: false,
+          error: null,
+        })
         try {
           set({ messages: await api.messages(accessToken, sessionId) })
         } catch (error) {
@@ -239,10 +265,21 @@ export const useWorkspaceStore = create<WorkspaceState>()(
       sendMessage: async (content) => {
         const text = content.trim()
         const { accessToken, activeSubject } = get()
-        if (!text || !accessToken || !activeSubject || get().isSending || get().isLoading) return false
-        set({ isSending: true, error: null })
+        if (
+          !text
+          || !accessToken
+          || !activeSubject
+          || get().isSending
+          || get().isStreaming
+          || get().isLoading
+        ) return false
+        const controller = new AbortController()
+        activeStreamController = controller
+        let sessionId = get().activeSessionId
+        let userId: string | null = null
+        let assistantId: string | null = null
+        set({ isSending: true, isStreaming: false, error: null })
         try {
-          let sessionId = get().activeSessionId
           if (!sessionId) {
             const session = await api.createChatSession(accessToken, activeSubject.id)
             sessionId = session.id
@@ -252,38 +289,149 @@ export const useWorkspaceStore = create<WorkspaceState>()(
               activeSessionId: session.id,
             }))
           }
-          const message = await api.createMessage(accessToken, sessionId, text)
+          if (controller.signal.aborted) return false
+          userId = `pending-user-${crypto.randomUUID()}`
+          assistantId = `pending-assistant-${crypto.randomUUID()}`
+          const now = new Date().toISOString()
+          const optimisticUser: Message = {
+            id: userId,
+            sessionId,
+            sender: 'user',
+            content: text,
+            sources: [],
+            ragMetadata: {},
+            createdAt: now,
+          }
+          const optimisticAssistant: Message = {
+            id: assistantId,
+            sessionId,
+            sender: 'assistant',
+            content: '',
+            sources: [],
+            ragMetadata: {},
+            createdAt: now,
+            isStreaming: true,
+          }
           set((state) => {
-            const updateSession = (session: ChatSession) =>
-              session.id === sessionId
-                ? {
-                    ...session,
-                    title: session.title === 'New Chat' ? text.slice(0, 42) : session.title,
-                    updatedAt: message.createdAt,
-                  }
-                : session
-            const sessionHistory = sortSessions(state.sessionHistory.map(updateSession))
+            const sessionHistory = sortSessions(
+              state.sessionHistory.map((session) =>
+                session.id === sessionId
+                  ? {
+                      ...session,
+                      title: session.title === 'New Chat' ? text.slice(0, 42) : session.title,
+                      updatedAt: now,
+                    }
+                  : session,
+              ),
+            )
             return {
               sessionHistory,
               sessions:
                 state.activeSubject?.id === activeSubject.id
-                  ? sortSessions(state.sessions.map(updateSession))
+                  ? sortSessions(
+                      state.sessions.map((session) =>
+                        session.id === sessionId
+                          ? {
+                              ...session,
+                              title: session.title === 'New Chat' ? text.slice(0, 42) : session.title,
+                              updatedAt: now,
+                            }
+                          : session,
+                      ),
+                    )
                   : state.sessions,
               messages:
                 state.activeSessionId === sessionId
-                  ? [...state.messages, message]
+                  ? [...state.messages, optimisticUser, optimisticAssistant]
                   : state.messages,
             }
           })
+          set({ isSending: false, isStreaming: true })
+          await api.streamChat(accessToken, sessionId, text, {
+            onSources: ({ sources, userMessage }) => {
+              set((state) => ({
+                messages:
+                  state.activeSessionId === sessionId
+                    ? state.messages.map((message) =>
+                        message.id === userId
+                          ? userMessage
+                          : message.id === assistantId
+                            ? { ...message, sources }
+                            : message,
+                      )
+                    : state.messages,
+              }))
+            },
+            onToken: (token) => {
+              set((state) => ({
+                messages:
+                  state.activeSessionId === sessionId
+                    ? state.messages.map((message) =>
+                        message.id === assistantId
+                          ? { ...message, content: message.content + token }
+                          : message,
+                      )
+                    : state.messages,
+              }))
+            },
+            onComplete: (message) => {
+              set((state) => ({
+                messages:
+                  state.activeSessionId === sessionId
+                    ? state.messages.map((existing) =>
+                        existing.id === assistantId ? message : existing,
+                      )
+                    : state.messages,
+                isStreaming: false,
+              }))
+            },
+          }, controller.signal)
           return true
         } catch (error) {
-          set({ error: errorMessage(error) })
+          if (controller.signal.aborted) {
+            if (sessionId && get().activeSessionId === sessionId) {
+              try {
+                const persistedMessages = await api.messages(accessToken, sessionId)
+                if (get().activeSessionId === sessionId) set({ messages: persistedMessages })
+              } catch (refreshError) {
+                if (get().activeSessionId === sessionId) {
+                  set({
+                    error: `Generation stopped, but saved messages could not be refreshed: ${errorMessage(refreshError)}`,
+                  })
+                }
+              }
+            }
+          } else {
+            let failure = errorMessage(error)
+            if (sessionId && get().activeSessionId === sessionId) {
+              try {
+                set({ messages: await api.messages(accessToken, sessionId) })
+              } catch (refreshError) {
+                failure = `${failure}. Could not refresh saved messages: ${errorMessage(refreshError)}`
+              }
+            }
+            set({ error: failure })
+          }
           return false
         } finally {
-          set({ isSending: false, isStreaming: false })
+          if (activeStreamController === controller) {
+            activeStreamController = null
+            set({ isSending: false, isStreaming: false })
+          }
         }
       },
-      stopGeneration: () => set({ isStreaming: false }),
+      stopGeneration: () => {
+        abortActiveStream()
+        set((state) => ({
+          isSending: false,
+          isStreaming: false,
+          messages: state.messages
+            .map((message) =>
+              message.isStreaming ? { ...message, isStreaming: false } : message,
+            )
+            .filter((message) => message.content || message.sender === 'user'),
+        }))
+      },
     }),
     {
       name: 'rag-workspace',

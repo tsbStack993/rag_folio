@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -12,13 +13,19 @@ from datetime import datetime, timezone
 from typing import Any, Iterator
 from uuid import UUID
 
+import httpx
 import psycopg
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+import rag_service
 
 load_dotenv()
 
@@ -151,18 +158,42 @@ def current_user_id(
 
 
 app = FastAPI(title="RAG Workspace API", version="1.0.0")
-origins = [
-    origin.strip()
-    for origin in os.getenv("FRONTEND_ORIGINS", "http://localhost:5173").split(",")
-    if origin.strip()
-]
+logger = logging.getLogger(__name__)
+origins = list(
+    {
+        "http://localhost:5173",
+        *(
+            origin.strip()
+            for origin in os.getenv("FRONTEND_ORIGINS", "").split(",")
+            if origin.strip()
+        ),
+    }
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, error: HTTPException) -> JSONResponse:
+    return JSONResponse(
+        status_code=error.status_code,
+        content={"detail": error.detail},
+        headers=error.headers,
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, error: Exception) -> JSONResponse:
+    logger.exception("Unhandled API exception on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Internal server error", "error": str(error)},
+    )
 
 
 @app.get("/health")
@@ -273,7 +304,7 @@ def require_owned_session(
     connection: psycopg.Connection[dict[str, Any]], session_id: UUID, user_id: UUID
 ) -> dict[str, Any]:
     session = connection.execute(
-        "SELECT id FROM chat_sessions WHERE id = %s AND user_id = %s",
+        "SELECT id, subject_id FROM chat_sessions WHERE id = %s AND user_id = %s",
         (session_id, user_id),
     ).fetchone()
     if session is None:
@@ -334,3 +365,167 @@ def create_message(
             (content, datetime.now(timezone.utc), session_id),
         )
     return snake_to_camel(message)
+
+
+def sse_event(payload: dict[str, Any]) -> str:
+    encoded_payload = jsonable_encoder(payload)
+    return (
+        "data: "
+        + json.dumps(encoded_payload, ensure_ascii=False, separators=(",", ":"))
+        + "\n\n"
+    )
+
+
+@app.post(
+    "/api/v1/chats/{session_id}/stream",
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "content": {
+                "text/event-stream": {"schema": {"type": "string"}},
+            },
+        },
+    },
+)
+async def stream_chat(
+    session_id: UUID,
+    request: CreateMessage,
+    user_id: UUID = Depends(current_user_id),
+) -> StreamingResponse:
+    content = request.content.strip()
+    if not content:
+        raise HTTPException(status_code=422, detail="Message content cannot be blank")
+
+    with database() as connection:
+        session = require_owned_session(connection, session_id, user_id)
+        history_rows = connection.execute(
+            """
+            SELECT sender, content
+            FROM messages
+            WHERE session_id = %s
+            ORDER BY created_at DESC, id DESC
+            LIMIT 12
+            """,
+            (session_id,),
+        ).fetchall()
+        user_message = connection.execute(
+            """
+            INSERT INTO messages (session_id, sender, content)
+            VALUES (%s, 'user', %s)
+            RETURNING id, session_id, sender, content, sources, rag_metadata, created_at
+            """,
+            (session_id, content),
+        ).fetchone()
+        connection.execute(
+            """
+            UPDATE chat_sessions
+            SET title = CASE
+                    WHEN title = 'New Chat' THEN LEFT(%s, 42)
+                    ELSE title
+                END,
+                updated_at = %s
+            WHERE id = %s
+            """,
+            (content, datetime.now(timezone.utc), session_id),
+        )
+
+    try:
+        query_embedding = await rag_service.embed_query(content)
+    except Exception as error:
+        logger.exception("Query embedding failed for chat session %s", session_id)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not create a query embedding with Ollama: {error}",
+        ) from error
+
+    try:
+        with database() as connection:
+            chunks = rag_service.retrieve_top_chunks(
+                connection, session["subject_id"], query_embedding, top_k=3
+            )
+    except Exception as error:
+        logger.exception("Vector retrieval failed for chat session %s", session_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not retrieve subject document chunks: {error}",
+        ) from error
+
+    history = [
+        {"role": row["sender"], "content": row["content"]}
+        for row in reversed(history_rows)
+    ]
+    citations = [
+        {key: chunk[key] for key in ("id", "title", "page", "score")}
+        for chunk in chunks
+    ]
+    ollama_messages = rag_service.build_messages(content, chunks, history)
+    sources_payload = {
+        "type": "sources",
+        "sources": citations,
+        "userMessage": snake_to_camel(user_message),
+    }
+
+    async def generate():
+        yield sse_event(sources_payload)
+        response_parts: list[str] = []
+        try:
+            async for token in rag_service.stream_completion(ollama_messages):
+                response_parts.append(token)
+                yield sse_event({"type": "token", "content": token})
+
+            if not response_parts:
+                raise RuntimeError("Ollama returned an empty response")
+
+            with database() as connection:
+                assistant_message = connection.execute(
+                    """
+                    INSERT INTO messages (
+                        session_id, sender, content, sources, rag_metadata
+                    )
+                    VALUES (%s, 'assistant', %s, %s, %s)
+                    RETURNING id, session_id, sender, content, sources, rag_metadata, created_at
+                    """,
+                    (
+                        session_id,
+                        "".join(response_parts),
+                        Jsonb(citations),
+                        Jsonb(
+                            {
+                                "model": rag_service.OLLAMA_LLM_MODEL,
+                                "retrieved_chunks": len(chunks),
+                                "history_messages": len(history),
+                            }
+                        ),
+                    ),
+                ).fetchone()
+                connection.execute(
+                    "UPDATE chat_sessions SET updated_at = %s WHERE id = %s",
+                    (datetime.now(timezone.utc), session_id),
+                )
+            yield sse_event(
+                {
+                    "type": "done",
+                    "assistantMessage": snake_to_camel(assistant_message),
+                }
+            )
+        except Exception as error:
+            logger.exception("Stream generation failed for chat session %s", session_id)
+            yield sse_event({"type": "error", "message": f"RAG response failed: {error}"})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# Keep CORS outside Starlette's error middleware so even unhandled-error responses
+# carry the configured browser CORS headers.
+fastapi_app = app
+app = CORSMiddleware(
+    app=fastapi_app,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)

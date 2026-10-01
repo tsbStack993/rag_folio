@@ -1,0 +1,20 @@
+id: 96b78557-cf98-549e-b7c0-4e92a009a396
+subject_id: 2d81c060-c217-4296-ae2e-fc8c0465dcd9
+excerpt: An embedded system combines a processor, memory, input and output circuitry, and software to perform
+
+id: 0545d660-8c6e-5f69-b3da-3bdcfd84cefd
+subject_id: 2e25f5a7-e8ea-48f0-aeca-8d7052be53cd
+excerpt: A digital image is a two-dimensional array of sampled intensity or color values. A grayscale image s
+
+id: e1dc0ba8-3be7-5b70-b092-df97ab508537
+subject_id: 51b94b91-5177-4a5f-ad13-ab9a5f8124bf
+excerpt: Cloud computing provides on-demand access to configurable compute, storage, and networking resources
+
+id: 181ffba2-88f8-5763-a2ff-f8386bdc3585
+subject_id: 53133bd4-d0c3-4d8d-847c-1e983f6ba1a5
+excerpt: Software engineering applies disciplined methods to building, operating, and evolving software. A li
+
+id: 19662db3-b367-5fe2-85d4-7505d657b4b2
+subject_id: 5e9ba4c8-9048-462f-8d03-afc26817c6f1
+excerpt: Digital signal processing represents measurements as sequences of numbers and uses algorithms to ana
+

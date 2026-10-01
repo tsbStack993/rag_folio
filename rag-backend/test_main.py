@@ -1,11 +1,17 @@
+import json
 import os
 import unittest
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
+
+from fastapi.testclient import TestClient
 
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 os.environ.setdefault("AUTH_SECRET", "unit-test-signing-secret-long-enough")
 
 import main
+import rag_service
+import ingest_documents
 
 
 class ApiHelpersTest(unittest.TestCase):
@@ -40,8 +46,36 @@ class ApiHelpersTest(unittest.TestCase):
         request = main.CreateSession.model_validate({"subjectId": str(subject_id)})
         self.assertEqual(request.subject_id, UUID(str(subject_id)))
 
+    def test_sse_event_encodes_nested_uuids_and_datetimes(self) -> None:
+        message_id = uuid4()
+        session_id = uuid4()
+        chunk_id = uuid4()
+        created_at = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+
+        event = main.sse_event(
+            {
+                "type": "sources",
+                "sources": [{"id": chunk_id}],
+                "userMessage": {
+                    "id": message_id,
+                    "session_id": session_id,
+                    "created_at": created_at,
+                },
+            }
+        )
+
+        self.assertTrue(event.startswith("data: "))
+        payload = json.loads(event.removeprefix("data: ").strip())
+        self.assertEqual(payload["sources"][0]["id"], str(chunk_id))
+        self.assertEqual(payload["userMessage"]["id"], str(message_id))
+        self.assertEqual(payload["userMessage"]["session_id"], str(session_id))
+        self.assertEqual(
+            payload["userMessage"]["created_at"],
+            "2026-09-30T12:00:00+00:00",
+        )
+
     def test_api_exposes_requested_resource_endpoints(self) -> None:
-        spec = main.app.openapi()
+        spec = main.fastapi_app.openapi()
         paths = set(spec["paths"])
         self.assertTrue(
             {
@@ -51,9 +85,121 @@ class ApiHelpersTest(unittest.TestCase):
                 "/api/v1/auth/me",
                 "/api/v1/chat-sessions",
                 "/api/v1/chat-sessions/{session_id}/messages",
+                "/api/v1/chats/{session_id}/stream",
             }.issubset(paths)
         )
         self.assertIn("HTTPBearer", spec["components"]["securitySchemes"])
+        self.assertIn(
+            "text/event-stream",
+            spec["paths"]["/api/v1/chats/{session_id}/stream"]["post"]["responses"]["200"][
+                "content"
+            ],
+        )
+
+    def test_unhandled_errors_return_json_with_frontend_cors_headers(self) -> None:
+        @main.fastapi_app.get("/test-unhandled-error")
+        def raise_unhandled_error() -> None:
+            raise RuntimeError("simulated route failure")
+
+        with TestClient(main.app, raise_server_exceptions=False) as client:
+            response = client.get(
+                "/test-unhandled-error",
+                headers={"Origin": "http://localhost:5173"},
+            )
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            response.headers["access-control-allow-origin"],
+            "http://localhost:5173",
+        )
+        self.assertEqual(response.json()["detail"], "Internal server error")
+        self.assertEqual(response.json()["error"], "simulated route failure")
+
+    def test_stream_auth_errors_and_preflight_include_cors_headers(self) -> None:
+        with TestClient(main.app, raise_server_exceptions=False) as client:
+            preflight = client.options(
+                f"/api/v1/chats/{uuid4()}/stream",
+                headers={
+                    "Origin": "http://localhost:5173",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "authorization,content-type",
+                },
+            )
+            unauthorized = client.post(
+                f"/api/v1/chats/{uuid4()}/stream",
+                headers={
+                    "Origin": "http://localhost:5173",
+                    "Authorization": "Bearer invalid-token",
+                },
+                json={"content": "test"},
+            )
+
+        self.assertEqual(preflight.status_code, 200)
+        self.assertEqual(
+            preflight.headers["access-control-allow-origin"],
+            "http://localhost:5173",
+        )
+        self.assertEqual(unauthorized.status_code, 401)
+        self.assertEqual(
+            unauthorized.headers["access-control-allow-origin"],
+            "http://localhost:5173",
+        )
+        self.assertEqual(unauthorized.json()["detail"], "Invalid or expired access token")
+
+    def test_vector_literal_requires_768_finite_values(self) -> None:
+        self.assertTrue(rag_service.vector_literal([0.0] * 768).startswith("[0.0,"))
+        with self.assertRaises(ValueError):
+            rag_service.vector_literal([0.0])
+        with self.assertRaises(ValueError):
+            rag_service.vector_literal([float("nan")] * 768)
+
+    def test_rag_prompt_includes_history_and_retrieved_content(self) -> None:
+        messages = rag_service.build_messages(
+            "What does it explain?",
+            [{"title": "Lecture", "page": 4, "content": "Relevant fact."}],
+            [{"role": "user", "content": "Earlier question."}],
+        )
+        self.assertIn("Relevant fact.", messages[0]["content"])
+        self.assertEqual(messages[1]["content"], "Earlier question.")
+        self.assertEqual(messages[2]["content"], "What does it explain?")
+
+    def test_starter_documents_cover_all_subjects_and_chunk_into_target_size(self) -> None:
+        self.assertEqual(
+            set(ingest_documents.STARTER_DOCUMENTS),
+            {
+                "embedded-system",
+                "cloud-technology",
+                "digital-image-processing",
+                "digital-signal-processing",
+                "software-engineering",
+            },
+        )
+        for _, text in ingest_documents.STARTER_DOCUMENTS.values():
+            chunks = ingest_documents.chunk_text(text)
+            self.assertTrue(chunks)
+            self.assertTrue(
+                all(
+                    ingest_documents.CHUNK_MIN_WORDS
+                    <= len(chunk.split())
+                    <= ingest_documents.CHUNK_MAX_WORDS
+                    for chunk in chunks
+                )
+            )
+
+    def test_long_starter_text_chunks_overlap_and_stay_within_bounds(self) -> None:
+        words = [f"word{index}." for index in range(1100)]
+        chunks = ingest_documents.chunk_text(" ".join(words))
+        self.assertTrue(
+            all(
+                ingest_documents.CHUNK_MIN_WORDS
+                <= len(chunk.split())
+                <= ingest_documents.CHUNK_MAX_WORDS
+                for chunk in chunks
+            )
+        )
+        self.assertEqual(
+            chunks[0].split()[-ingest_documents.CHUNK_OVERLAP_WORDS :],
+            chunks[1].split()[: ingest_documents.CHUNK_OVERLAP_WORDS],
+        )
 
 
 if __name__ == "__main__":

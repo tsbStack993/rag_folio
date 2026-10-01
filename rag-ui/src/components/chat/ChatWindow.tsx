@@ -73,7 +73,7 @@ function SourceAccordion({ message }: { message: Message }) {
       {isOpen && (
         <div className="sources-list">
           {message.sources.map((source) => (
-            <div className="source-row" key={`${source.title}-${source.page}`}>
+            <div className="source-row" key={source.id ?? `${source.title}-${source.page}`}>
               <div className="source-file-icon"><FileText size={15} /></div>
               <div className="source-info"><strong>{source.title}</strong><span>Page {source.page}</span></div>
               <span className="source-score">{Math.round(source.score * 100)}%</span>
@@ -301,7 +301,7 @@ export function ChatWindow({ onOpenSidebar }: { onOpenSidebar: () => void }) {
             )}
           </div>
         </form>
-        <p className="composer-disclaimer">Assistant responses will be available when the RAG service is connected.</p>
+        <p className="composer-disclaimer">Responses use local Ollama models and your subject sources.</p>
       </footer>
     </section>
   )
