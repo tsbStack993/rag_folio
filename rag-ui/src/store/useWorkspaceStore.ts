@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { createJSONStorage, persist } from 'zustand/middleware'
 import { api, ApiError } from '../lib/api'
 import type { ChatSession, Message, Subject, User } from '../types/workspace'
+import { generateUUID } from '../utils/uuid'
 
 type WorkspaceState = {
   theme: 'dark' | 'light'
@@ -290,8 +291,8 @@ export const useWorkspaceStore = create<WorkspaceState>()(
             }))
           }
           if (controller.signal.aborted) return false
-          userId = `pending-user-${crypto.randomUUID()}`
-          assistantId = `pending-assistant-${crypto.randomUUID()}`
+          userId = `pending-user-${generateUUID()}`
+          assistantId = `pending-assistant-${generateUUID()}`
           const now = new Date().toISOString()
           const optimisticUser: Message = {
             id: userId,

@@ -20,11 +20,16 @@ The Neon connection string is used only by this backend; do not put it in `rag-u
 5. Start Ollama, then run `python ingest_documents.py` from `rag-backend` to upsert sample
    subject notes with citations and embeddings. The script is safe to rerun. You can edit
    or extend `STARTER_DOCUMENTS` in that file to add material; subjects must be seeded first.
-6. Start the API with `uvicorn main:app --reload`.
+6. Start the API with `uvicorn main:app --reload --host 0.0.0.0`. Binding to
+   `0.0.0.0` is needed for mobile/LAN clients; from those clients, configure
+   `VITE_API_BASE_URL` to use this computer's LAN address rather than `localhost`.
 
 The API is available at `http://localhost:8000`; interactive OpenAPI docs are at
 `http://localhost:8000/docs`. `FRONTEND_ORIGINS` is a comma-separated list of allowed
 browser origins and defaults to `http://localhost:5173`.
+For local-network testing, the API also accepts HTTP(S) origins from localhost and
+private IPv4 ranges (`192.168.x.x`, `10.x.x.x`, and `172.16.x.x`–`172.31.x.x`) on
+arbitrary development ports, including credentialed preflight requests.
 If `AUTH_SECRET` is omitted, local development derives a signing key from `DATABASE_URL`
 and emits a warning; configure a dedicated secret before deployment.
 

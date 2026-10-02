@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -6,11 +7,12 @@ import logging
 import os
 import re
 import secrets
+import sys
 import time
 import warnings
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
-from typing import Any, Iterator
+from typing import Any, AsyncIterator, Iterator
 from uuid import UUID
 
 import httpx
@@ -28,6 +30,11 @@ from psycopg.types.json import Jsonb
 import rag_service
 
 load_dotenv()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout,
+)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -49,6 +56,13 @@ if len(AUTH_SECRET) < 32:
 
 TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+LOCAL_ORIGIN_REGEX = (
+    r"^https?://(?:localhost|127\.0\.0\.1|"
+    r"192\.168(?:\.\d{1,3}){2}|"
+    r"10(?:\.\d{1,3}){3}|"
+    r"172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})"
+    r"(?::\d{1,5})?$"
+)
 
 
 def snake_to_camel(value: Any) -> Any:
@@ -117,8 +131,31 @@ def verify_password(password: str, encoded: str) -> bool:
 
 @contextmanager
 def database() -> Iterator[psycopg.Connection[dict[str, Any]]]:
-    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as connection:
+    with psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+        connect_timeout=5,
+        sslmode="require",
+    ) as connection:
         yield connection
+
+
+def check_database_connection() -> None:
+    with database() as connection:
+        connection.execute("SELECT 1")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    try:
+        await asyncio.to_thread(check_database_connection)
+    except Exception:
+        print("[ERROR] Failed to connect to Neon DB", flush=True)
+        logger.exception("Database connectivity check failed during startup")
+    else:
+        print("[SUCCESS] Connected to Neon DB", flush=True)
+        logger.info("Database connectivity check succeeded during startup")
+    yield
 
 
 class Credentials(BaseModel):
@@ -157,7 +194,7 @@ def current_user_id(
     return decode_token(credentials.credentials)
 
 
-app = FastAPI(title="RAG Workspace API", version="1.0.0")
+app = FastAPI(title="RAG Workspace API", lifespan=lifespan)
 logger = logging.getLogger(__name__)
 origins = list(
     {
@@ -172,10 +209,28 @@ origins = list(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=LOCAL_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_http_requests(request: Request, call_next):
+    logger.info("Incoming request %s %s", request.method, request.url.path)
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("Request failed before returning a response")
+        raise
+    logger.info(
+        "Completed request %s %s with status %s",
+        request.method,
+        request.url.path,
+        response.status_code,
+    )
+    return response
 
 
 @app.exception_handler(HTTPException)
@@ -525,6 +580,7 @@ fastapi_app = app
 app = CORSMiddleware(
     app=fastapi_app,
     allow_origins=origins,
+    allow_origin_regex=LOCAL_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

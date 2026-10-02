@@ -1,7 +1,10 @@
 import json
 import os
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
+from io import StringIO
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
@@ -101,11 +104,12 @@ class ApiHelpersTest(unittest.TestCase):
         def raise_unhandled_error() -> None:
             raise RuntimeError("simulated route failure")
 
-        with TestClient(main.app, raise_server_exceptions=False) as client:
-            response = client.get(
-                "/test-unhandled-error",
-                headers={"Origin": "http://localhost:5173"},
-            )
+        with patch("main.check_database_connection"):
+            with TestClient(main.app, raise_server_exceptions=False) as client:
+                response = client.get(
+                    "/test-unhandled-error",
+                    headers={"Origin": "http://localhost:5173"},
+                )
         self.assertEqual(response.status_code, 500)
         self.assertEqual(
             response.headers["access-control-allow-origin"],
@@ -115,23 +119,24 @@ class ApiHelpersTest(unittest.TestCase):
         self.assertEqual(response.json()["error"], "simulated route failure")
 
     def test_stream_auth_errors_and_preflight_include_cors_headers(self) -> None:
-        with TestClient(main.app, raise_server_exceptions=False) as client:
-            preflight = client.options(
-                f"/api/v1/chats/{uuid4()}/stream",
-                headers={
-                    "Origin": "http://localhost:5173",
-                    "Access-Control-Request-Method": "POST",
-                    "Access-Control-Request-Headers": "authorization,content-type",
-                },
-            )
-            unauthorized = client.post(
-                f"/api/v1/chats/{uuid4()}/stream",
-                headers={
-                    "Origin": "http://localhost:5173",
-                    "Authorization": "Bearer invalid-token",
-                },
-                json={"content": "test"},
-            )
+        with patch("main.check_database_connection"):
+            with TestClient(main.app, raise_server_exceptions=False) as client:
+                preflight = client.options(
+                    f"/api/v1/chats/{uuid4()}/stream",
+                    headers={
+                        "Origin": "http://localhost:5173",
+                        "Access-Control-Request-Method": "POST",
+                        "Access-Control-Request-Headers": "authorization,content-type",
+                    },
+                )
+                unauthorized = client.post(
+                    f"/api/v1/chats/{uuid4()}/stream",
+                    headers={
+                        "Origin": "http://localhost:5173",
+                        "Authorization": "Bearer invalid-token",
+                    },
+                    json={"content": "test"},
+                )
 
         self.assertEqual(preflight.status_code, 200)
         self.assertEqual(
@@ -144,6 +149,50 @@ class ApiHelpersTest(unittest.TestCase):
             "http://localhost:5173",
         )
         self.assertEqual(unauthorized.json()["detail"], "Invalid or expired access token")
+
+    def test_lan_login_preflight_allows_credentials_methods_and_headers(self) -> None:
+        with patch("main.check_database_connection"):
+            with TestClient(main.app, raise_server_exceptions=False) as client:
+                response = client.options(
+                    "/api/v1/auth/login",
+                    headers={
+                        "Origin": "http://192.168.1.42:5173",
+                        "Access-Control-Request-Method": "POST",
+                        "Access-Control-Request-Headers": "accept,authorization,content-type",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.headers["access-control-allow-origin"],
+            "http://192.168.1.42:5173",
+        )
+        self.assertEqual(response.headers["access-control-allow-credentials"], "true")
+        self.assertIn("POST", response.headers["access-control-allow-methods"])
+        allowed_headers = response.headers["access-control-allow-headers"].lower()
+        self.assertIn("accept", allowed_headers)
+        self.assertIn("authorization", allowed_headers)
+        self.assertIn("content-type", allowed_headers)
+
+    def test_database_connections_use_neon_ssl_and_short_timeout(self) -> None:
+        with patch("main.psycopg.connect") as connect:
+            with main.database():
+                pass
+        connect.assert_called_once_with(
+            main.DATABASE_URL,
+            row_factory=main.dict_row,
+            connect_timeout=5,
+            sslmode="require",
+        )
+
+    def test_lifespan_reports_successful_database_check(self) -> None:
+        output = StringIO()
+        with patch("main.check_database_connection") as check_database:
+            with redirect_stdout(output):
+                with TestClient(main.app):
+                    pass
+        check_database.assert_called_once_with()
+        self.assertIn("[SUCCESS] Connected to Neon DB", output.getvalue())
 
     def test_vector_literal_requires_768_finite_values(self) -> None:
         self.assertTrue(rag_service.vector_literal([0.0] * 768).startswith("[0.0,"))
